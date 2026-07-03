@@ -2,7 +2,6 @@
 
 use std::num::NonZeroUsize;
 
-use tinymist_project::LspWorld;
 use tinymist_std::typst::TypstDocument;
 use tinymist_world::debug_loc::SourceSpanOffset;
 use typst::{
@@ -16,8 +15,8 @@ use typst_shim::syntax::LinkedNodeExt;
 
 /// Finds a span range from a clicked physical position in a rendered paged
 /// document.
-pub fn jump_from_click(
-    world: &LspWorld,
+pub fn jump_from_click<W: World>(
+    world: &W,
     frame: &Frame,
     click: Point,
 ) -> Option<(SourceSpanOffset, SourceSpanOffset)> {
@@ -119,11 +118,6 @@ fn jump_from_cursor_(
     let span = node.span();
     let offset = cursor.saturating_sub(node.offset());
 
-    // todo: The cursor may not exact hit at the start of some AST node. For
-    // example, the cursor in the text element `Hell|o` is offset by 4 from the
-    // node. It seems not pretty if we ignore the offset completely.
-    let _ = offset;
-
     match document {
         TypstDocument::Paged(paged_doc) => {
             // We checks whether there are any elements exactly matching the
@@ -140,7 +134,8 @@ fn jump_from_cursor_(
                 // In a page, we try to find a closer span than the existing found one.
                 let mut p_dis = min_dis;
 
-                if let Some(point) = find_in_frame(&page.frame, span, &mut p_dis, &mut min_point)
+                if let Some(point) =
+                    find_in_frame(&page.frame, span, offset, &mut p_dis, &mut min_point)
                     && let Some(page) = NonZeroUsize::new(idx + 1)
                 {
                     positions.push(Position { page, point });
@@ -168,19 +163,46 @@ fn jump_from_cursor_(
 }
 
 /// Finds the position of a span in a frame.
-fn find_in_frame(frame: &Frame, span: Span, min_dis: &mut u64, res: &mut Point) -> Option<Point> {
+fn find_in_frame(
+    frame: &Frame,
+    span: Span,
+    offset: usize,
+    min_dis: &mut u64,
+    res: &mut Point,
+) -> Option<Point> {
     for &(mut pos, ref item) in frame.items() {
         if let FrameItem::Group(group) = item {
             // TODO: Handle transformation.
-            if let Some(point) = find_in_frame(&group.frame, span, min_dis, res) {
+            if let Some(point) = find_in_frame(&group.frame, span, offset, min_dis, res) {
                 return Some(point + pos);
             }
         }
 
         if let FrameItem::Text(text) = item {
             for glyph in &text.glyphs {
+                let width = glyph.x_advance.at(text.size);
                 if glyph.span.0 == span {
-                    return Some(pos);
+                    let glyph_start = glyph.span.1 as usize;
+                    let glyph_end = glyph_start + glyph.range().len();
+                    if (glyph_start..=glyph_end).contains(&offset) {
+                        return Some(cursor_point_for_glyph(
+                            pos,
+                            width,
+                            glyph_start,
+                            glyph_end,
+                            offset,
+                        ));
+                    }
+
+                    let dis = if offset < glyph_start {
+                        glyph_start - offset
+                    } else {
+                        offset - glyph_end
+                    } as u64;
+                    if dis < *min_dis {
+                        *min_dis = dis;
+                        *res = cursor_point_for_glyph(pos, width, glyph_start, glyph_end, offset);
+                    }
                 }
 
                 // We at least require that the span is in the same file.
@@ -198,12 +220,26 @@ fn find_in_frame(frame: &Frame, span: Span, min_dis: &mut u64, res: &mut Point) 
                         *res = pos;
                     }
                 }
-                pos.x += glyph.x_advance.at(text.size);
+                pos.x += width;
             }
         }
     }
 
     None
+}
+
+fn cursor_point_for_glyph(
+    pos: Point,
+    width: typst::layout::Abs,
+    glyph_start: usize,
+    glyph_end: usize,
+    offset: usize,
+) -> Point {
+    if glyph_end > glyph_start && offset >= glyph_end {
+        Point::new(pos.x + width * 0.75, pos.y)
+    } else {
+        Point::new(pos.x + width * 0.25, pos.y)
+    }
 }
 
 /// Whether a rectangle with the given size at the given position contains the
