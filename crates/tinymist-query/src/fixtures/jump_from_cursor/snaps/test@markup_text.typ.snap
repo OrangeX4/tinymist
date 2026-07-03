@@ -1,10 +1,10 @@
 ---
 source: crates/tinymist-query/src/jump.rs
-assertion_line: 288
+assertion_line: 286
 description: "Jump cursor on  */\n$ H e |l l| o W o r l)"
 expression: results
 input_file: crates/tinymist-query/src/fixtures/jump_from_cursor/markup_text.typ
 ---
-nothing
 1,284.174pt,78.500pt
-nothing
+1,284.174pt,78.500pt
+1,287.452pt,78.500pt

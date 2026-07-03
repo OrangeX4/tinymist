@@ -8,10 +8,9 @@ use typst::{
     World,
     introspection::PagedPosition as Position,
     layout::{Frame, FrameItem, Point, Size},
-    syntax::{LinkedNode, Source, Span, SyntaxKind},
+    syntax::{LinkedNode, Side, Source, Span, SyntaxKind},
     visualize::Geometry,
 };
-use typst_shim::syntax::LinkedNodeExt;
 
 /// Finds a span range from a clicked physical position in a rendered paged
 /// document.
@@ -104,16 +103,15 @@ fn jump_from_cursor_(
     source: &Source,
     cursor: usize,
 ) -> Option<Vec<Position>> {
-    // todo: leaf_at_compat only matches the text before the cursor, but we could
-    // also match a text if it is after the cursor
-    // The case `leaf_at_compat` will match: `Hello|`
-    // FIXME: The case `leaf_at_compat` will not match: `|Hello`
-    let node = LinkedNode::new(source.root()).leaf_at_compat(cursor)?;
-    // todo: When we click on a label or some math operators, we seems likely also
-    // be able to jump to some place.
-    if !matches!(node.kind(), SyntaxKind::Text | SyntaxKind::MathText) {
-        return None;
-    };
+    fn is_jumpable_text(node: &LinkedNode) -> bool {
+        matches!(node.kind(), SyntaxKind::Text | SyntaxKind::MathText)
+    }
+
+    let root = LinkedNode::new(source.root());
+    let node = root
+        .leaf_at(cursor, Side::Before)
+        .filter(is_jumpable_text)
+        .or_else(|| root.leaf_at(cursor, Side::After).filter(is_jumpable_text))?;
 
     let span = node.span();
     let offset = cursor.saturating_sub(node.offset());
