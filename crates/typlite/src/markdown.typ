@@ -191,7 +191,14 @@
   show strong: it => if-not-paged(it, md-strong(it.body, delta: it.delta))
   show emph: it => if-not-paged(it, md-emph(it.body))
   // todo: icc?
-  show image: it => if-not-paged(it, md-image(src: it.source, alt: it.alt))
+  show image: it => if-not-paged(
+    it,
+    if type(it.source) == str {
+      md-image(src: it.source, alt: it.alt)
+    } else {
+      html.frame(it)
+    },
+  )
 
   show raw: it => if-not-paged(it, md-raw(lang: it.lang, block: it.block, text: it.text, it))
   show link: it => if-not-paged(it, md-link(dest: it.dest, it.body))

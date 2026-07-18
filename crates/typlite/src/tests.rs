@@ -28,6 +28,20 @@ fn convert_tex() {
 }
 
 #[test]
+fn convert_byte_image() {
+    snapshot_testing("image_bytes", &|world, _path| {
+        insta::assert_snapshot!(conv(world, ConvKind::Md { for_docs: false }));
+    });
+}
+
+#[test]
+fn convert_byte_image_tex() {
+    snapshot_testing("image_bytes", &|world, _path| {
+        insta::assert_snapshot!(conv(world, ConvKind::LaTeX));
+    });
+}
+
+#[test]
 fn convert_docs() {
     snapshot_testing("docs", &|world, _path| {
         insta::assert_snapshot!(conv(world, ConvKind::Md { for_docs: true }));

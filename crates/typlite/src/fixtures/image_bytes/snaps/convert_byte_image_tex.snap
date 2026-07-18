@@ -1,0 +1,15 @@
+---
+source: crates/typlite/src/tests.rs
+expression: "conv(world, ConvKind::LaTeX)"
+input_file: crates/typlite/src/fixtures/image_bytes/image.typ
+---
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+  </head>
+  <body><m1document>redacted-frame</m1document></body>
+</html>
+
+=====

@@ -1,0 +1,5 @@
+#image(
+  bytes(`<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12"><circle cx="6" cy="6" r="5" fill="red"/></svg>`.text),
+  format: "svg",
+  width: 12pt,
+)
