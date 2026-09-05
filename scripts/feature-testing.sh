@@ -8,7 +8,9 @@ cargo clippy -p typlite --no-default-features --features=cli,docx,no-content-hin
 
 cargo clippy -p tinymist --no-default-features --features=no-content-hint
 cargo clippy -p tinymist --no-default-features --features=no-content-hint,preview
-# cargo clippy -p tinymist --no-default-features --features=no-content-hint,export
+cargo clippy -p tinymist --no-default-features --features=no-content-hint,export
 # cargo clippy -p tinymist --no-default-features --features=no-content-hint,trace
 cargo clippy -p tinymist --no-default-features --features=no-content-hint,dap
 cargo clippy -p tinymist --no-default-features --features=no-content-hint,web
+cargo clippy -p tinymist --no-default-features --features=no-content-hint,web,export
+cargo clippy -p tinymist --target wasm32-unknown-unknown --no-default-features --features=no-content-hint,web,export

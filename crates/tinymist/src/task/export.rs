@@ -1,9 +1,7 @@
 //! The actor that handles various document export, like PDF and SVG export.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, OnceLock};
-use std::{ops::DerefMut, pin::Pin};
 
 use reflexo::ImmutPath;
 use reflexo_typst::{
@@ -17,14 +15,15 @@ use tinymist_query::{
     PagedExportResponse, GLOBAL_STATS,
 };
 use tinymist_std::error::prelude::*;
-use tinymist_std::fs::paths::write_atomic;
+#[cfg(feature = "system")]
 use tinymist_std::path::PathClean;
 use tinymist_std::typst::TypstDocument;
 use tinymist_task::{
     output_template, pdf_options, DocumentQuery, ExportBundleTask, ExportMarkdownTask,
-    ExportPngTask, ExportSvgTask, ExportTarget, ImageOutput, PathPattern, PdfExport, PngExport,
-    SvgExport, TextExport,
+    ExportTarget, ImageOutput, PathPattern, PdfExport, PngExport, SvgExport, TextExport,
 };
+#[cfg(feature = "system")]
+use tinymist_task::{ExportPngTask, ExportSvgTask};
 use tokio::sync::mpsc;
 use typlite::{Format, Typlite};
 use typst::diag::Warned;
@@ -32,17 +31,20 @@ use typst::ecow::EcoString;
 use typst::foundations::Repr;
 use typst_bundle::{Bundle, BundleOptions, VirtualFs};
 
-use futures::Future;
-use parking_lot::Mutex;
-use rayon::Scope;
-
 use super::SyncTaskFactory;
+#[path = "export_scheduling.rs"]
+mod scheduling;
+use scheduling::FutureFolder;
+#[cfg(feature = "system")]
+#[path = "export_filesystem.rs"]
+mod filesystem;
 use crate::lsp::query::QueryFuture;
+#[cfg(feature = "lock")]
+use crate::project::PROJECT_ROUTE_USER_ACTION_PRIORITY;
 use crate::project::{
-    update_lock, ApplyProjectTask, CompiledArtifact, DevEvent, DevExportEvent, EntryReader,
-    ExportHtmlTask, ExportPdfTask, ExportTask as ProjectExportTask, ExportTeXTask, ExportTextTask,
-    LspCompiledArtifact, LspComputeGraph, ProjectClient, ProjectTask, TaskWhen,
-    PROJECT_ROUTE_USER_ACTION_PRIORITY,
+    CompiledArtifact, DevEvent, DevExportEvent, EntryReader, ExportHtmlTask, ExportPdfTask,
+    ExportTask as ProjectExportTask, ExportTeXTask, ExportTextTask, LspCompiledArtifact,
+    LspComputeGraph, ProjectClient, ProjectTask, TaskWhen,
 };
 use crate::world::TaskInputs;
 use crate::ServerState;
@@ -59,11 +61,13 @@ impl ServerState {
         } = req;
         let entry = self.entry_resolver().resolve(Some(path.as_path().into()));
 
+        #[cfg(feature = "lock")]
         let lock_dir = self.entry_resolver().resolve_lock(&entry);
+        #[cfg(feature = "lock")]
         let update_dep = lock_dir.clone().map(|lock_dir| {
             |snap: LspComputeGraph| {
                 tokio::spawn(async move {
-                    let mut updater = update_lock(lock_dir.clone());
+                    let mut updater = crate::project::update_lock(lock_dir.clone());
                     let world = snap.world();
                     // todo: rootless.
                     let root_dir = world.entry_state().root()?;
@@ -78,6 +82,9 @@ impl ServerState {
                 });
             }
         });
+
+        #[cfg(not(feature = "lock"))]
+        let update_dep = None::<fn(LspComputeGraph)>;
 
         let snap = self.snapshot().map_err(internal_error)?;
         just_future(async move {
@@ -118,7 +125,18 @@ impl ServerState {
             .memory_changes
             .get(path.as_path())
             .map(|s| Ok(s.text().to_owned()))
-            .unwrap_or_else(|| tinymist_std::fs::paths::read(&path))
+            .unwrap_or_else(|| {
+                #[cfg(feature = "system")]
+                {
+                    tinymist_std::fs::paths::read(&path)
+                }
+                #[cfg(not(feature = "system"))]
+                {
+                    Err(anyhow::anyhow!(
+                        "source has not been published to the memory workspace"
+                    ))
+                }
+            })
             .context("failed to read markdown file")
             .map_err(invalid_params)?;
 
@@ -337,8 +355,7 @@ impl ExportTask {
             Box::pin(async move {
                 let id = artifact.id().clone();
                 let doc = artifact.doc?;
-                let wc =
-                    log_err(FutureFolder::compute(move |_| word_count::word_count(&doc)).await);
+                let wc = log_err(FutureFolder::compute(move || word_count::word_count(&doc)).await);
                 log::debug!("WordCount({id:?}:{rev}): {wc:?}");
 
                 if let Some(wc) = wc {
@@ -354,6 +371,7 @@ impl ExportTask {
         Some(())
     }
 
+    #[cfg(feature = "system")]
     fn prepare_output_path(task: &ProjectTask, graph: &LspComputeGraph) -> Result<Option<PathBuf>> {
         let entry = graph.snap.world.entry_state();
         let config = task.as_export().unwrap();
@@ -406,9 +424,10 @@ impl ExportTask {
     ) -> Result<Option<OnExportResponse>> {
         use base64::prelude::*;
 
-        let CompiledArtifact { graph, .. } = &artifact;
-
-        let write_to = Self::prepare_output_path(&task, graph)?;
+        #[cfg(feature = "system")]
+        let write_to = Self::prepare_output_path(&task, &artifact.graph)?;
+        #[cfg(not(feature = "system"))]
+        let write_to = None::<PathBuf>;
 
         let artifact = Self::do_export_bytes(task, artifact, 0).await?;
 
@@ -449,130 +468,22 @@ impl ExportTask {
                         .collect(),
                 }
             }
-            ExportArtifact::Bundle { .. } => {
-                bail!("cannot export bundle to memory")
+            ExportArtifact::Bundle { items } => {
+                bail!("cannot export a bundle of {} files to memory", items.len())
             }
         };
 
         Ok(Some(res))
     }
 
-    /// Exports a document.
+    /// Filesystem output is unavailable without the system capability.
+    #[cfg(not(feature = "system"))]
     pub async fn do_export(
-        task: ProjectTask,
-        artifact: LspCompiledArtifact,
-        lock_dir: Option<ImmutPath>,
+        _task: ProjectTask,
+        _artifact: LspCompiledArtifact,
+        _lock_dir: Option<ImmutPath>,
     ) -> Result<Option<OnExportResponse>> {
-        let CompiledArtifact { graph, .. } = &artifact;
-
-        let Some(write_to) = Self::prepare_output_path(&task, graph)? else {
-            return Ok(None);
-        };
-
-        static EXPORT_ID: AtomicUsize = AtomicUsize::new(0);
-        let export_id = EXPORT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-        log::debug!(
-            "ExportTask({export_id},lock={lock_dir:?}): exporting {entry:?} to {write_to:?}",
-            entry = graph.snap.world.entry_state()
-        );
-        if let Some(e) = write_to.parent() {
-            if !e.exists() {
-                std::fs::create_dir_all(e).context("failed to create directory")?;
-            }
-        }
-
-        let _: Option<()> = lock_dir.and_then(|lock_dir| {
-            let mut updater = crate::project::update_lock(lock_dir.clone());
-            let root = graph.world().entry_state().root()?;
-
-            let doc_id = updater.compiled(graph.world(), (&root, &lock_dir))?;
-
-            updater.task(ApplyProjectTask {
-                id: doc_id.clone(),
-                document: doc_id.clone(),
-                task: task.clone(),
-            });
-            updater.update_materials(doc_id.clone(), graph.world().depended_fs_paths());
-            updater.route(doc_id, PROJECT_ROUTE_USER_ACTION_PRIORITY);
-            updater.commit();
-
-            Some(())
-        });
-
-        // Generate the data using common logic
-        let artifact = Self::do_export_bytes(task.clone(), artifact, export_id).await?;
-
-        let res = match artifact {
-            ExportArtifact::Single(data) => {
-                let res = OnExportResponse::Single {
-                    path: Some(write_to.clone()),
-                    data: None,
-                };
-
-                let to = write_to.clone();
-                tokio::task::spawn_blocking(move || write_atomic(to, data))
-                    .await
-                    .context_ut("failed to export")??;
-
-                res
-            }
-            ExportArtifact::Paged { total_pages, items } => {
-                let can_handle_multiple =
-                    output_template::has_indexable_template(write_to.to_str().unwrap_or_default());
-
-                if !can_handle_multiple && items.len() > 1 {
-                    bail!("cannot export multiple images without a page number template ({{p}}, {{0p}}) in the output path");
-                }
-
-                let mut res_items = Vec::new();
-                let mut write_futures = Vec::new();
-                for (page_idx, bytes) in items {
-                    let to = if can_handle_multiple {
-                        let storage = output_template::format(
-                            write_to.to_str().unwrap_or_default(),
-                            page_idx + 1,
-                            total_pages,
-                        );
-                        PathBuf::from(storage)
-                    } else {
-                        write_to.clone()
-                    };
-
-                    res_items.push(PagedExportResponse {
-                        page: page_idx,
-                        path: Some(to.clone()),
-                        data: None,
-                    });
-
-                    let fut = tokio::task::spawn_blocking(move || write_atomic(to, bytes));
-                    write_futures.push(fut);
-                }
-
-                // Await all writes in parallel
-                for result in futures::future::join_all(write_futures).await {
-                    result.context_ut("failed to export")??;
-                }
-
-                OnExportResponse::Paged {
-                    total_pages,
-                    items: res_items,
-                }
-            }
-            ExportArtifact::Bundle { items } => {
-                let root = write_to.clone();
-                let fut = tokio::task::spawn_blocking(move || write_bundle_files(&root, &items));
-                fut.await.context_ut("failed to export")??;
-
-                OnExportResponse::Single {
-                    path: Some(write_to),
-                    data: None,
-                }
-            }
-        };
-
-        log::debug!("ExportTask({export_id}): export complete");
-        Ok(Some(res))
+        bail!("filesystem export is unavailable in this build")
     }
 
     /// Export a document into bytes.
@@ -589,7 +500,7 @@ impl ExportTask {
         } = artifact;
 
         if let ExportBundle(config) = task {
-            return FutureFolder::compute(move |_| export_bundle_artifact(&graph, &config)).await?;
+            return FutureFolder::compute(move || export_bundle_artifact(&graph, &config)).await?;
         }
 
         // Prepare the document.
@@ -608,7 +519,7 @@ impl ExportTask {
         };
 
         // Prepare data.
-        let data = FutureFolder::compute(move |_| -> Result<ExportArtifact> {
+        let data = FutureFolder::compute(move || -> Result<ExportArtifact> {
             let doc = &doc;
 
             // static BLANK: Lazy<Page> = Lazy::new(Page::default);
@@ -817,18 +728,6 @@ fn collect_bundle_files(fs: &VirtualFs) -> Result<Vec<(PathBuf, Bytes)>> {
         .collect()
 }
 
-fn write_bundle_files(root: &Path, items: &[(PathBuf, Bytes)]) -> Result<()> {
-    std::fs::create_dir_all(root).context("failed to create output directory")?;
-    for (path, data) in items {
-        let realized = root.join(path);
-        if let Some(parent) = realized.parent() {
-            std::fs::create_dir_all(parent).context("failed to create directory")?;
-        }
-        write_atomic(realized, data.clone()).context("failed to write file")?;
-    }
-    Ok(())
-}
-
 /// User configuration for export.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ExportUserConfig {
@@ -876,7 +775,10 @@ fn extra_compile_for_export<
 >(
     world: &LspWorld,
 ) -> Result<Arc<D>> {
+    #[cfg(feature = "system")]
     let res = tokio::task::block_in_place(|| CompilationTask::<D>::execute(world));
+    #[cfg(not(feature = "system"))]
+    let res = CompilationTask::<D>::execute(world);
 
     match res.output {
         Ok(v) => Ok(v),
@@ -889,83 +791,15 @@ fn extra_compile_for_export<
     }
 }
 
-type FoldFuture = Pin<Box<dyn Future<Output = Option<()>> + Send>>;
-
-#[derive(Default)]
-struct FoldingState {
-    running: bool,
-    task: Option<(usize, FoldFuture)>,
-}
-
-#[derive(Clone, Default)]
-struct FutureFolder {
-    state: Arc<Mutex<FoldingState>>,
-}
-
-impl FutureFolder {
-    async fn compute<'scope, OP, R: Send + 'static>(op: OP) -> Result<R>
-    where
-        OP: FnOnce(&Scope<'scope>) -> R + Send + 'static,
-    {
-        tokio::task::spawn_blocking(move || -> R { rayon::in_place_scope(op) })
-            .await
-            .context_ut("compute error")
-    }
-
-    #[must_use]
-    fn spawn(
-        &self,
-        revision: usize,
-        fut: impl FnOnce() -> FoldFuture,
-    ) -> Option<impl Future<Output = ()> + Send + 'static> {
-        let mut state = self.state.lock();
-        let state = state.deref_mut();
-
-        match &mut state.task {
-            Some((prev_revision, prev)) => {
-                if *prev_revision < revision {
-                    *prev = fut();
-                    *prev_revision = revision;
-                }
-
-                return None;
-            }
-            next_update => {
-                *next_update = Some((revision, fut()));
-            }
-        }
-
-        if state.running {
-            return None;
-        }
-
-        state.running = true;
-
-        let state = self.state.clone();
-        Some(async move {
-            loop {
-                let fut = {
-                    let mut state = state.lock();
-                    let Some((_, fut)) = state.task.take() else {
-                        state.running = false;
-                        return;
-                    };
-                    fut
-                };
-                fut.await;
-            }
-        })
-    }
-}
-
-fn open_external(path: &Path) {
+fn open_external(_path: &Path) {
     #[cfg(not(feature = "open"))]
-    if open {
+    {
         log::warn!("open is not supported in this build, ignoring");
     }
 
     #[cfg(feature = "open")]
     {
+        let path = _path;
         // See https://github.com/Myriad-Dreamin/tinymist/issues/837
         // Also see https://github.com/Byron/open-rs/issues/105
         #[cfg(not(target_os = "windows"))]
@@ -980,239 +814,6 @@ fn open_external(path: &Path) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::fs;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use clap::Parser;
-
-    use super::*;
-    use crate::export::ProjectCompilation;
-    use crate::project::{CompileOnceArgs, CompileSignal, WorldProvider};
-    use crate::world::base::{CompileSnapshot, WorldComputeGraph};
-
-    #[test]
-    fn test_default_never() {
-        let conf = ExportUserConfig::default();
-        assert!(!conf.count_words);
-        assert_eq!(conf.task.when(), Some(&TaskWhen::Never));
-    }
-
-    #[test]
-    fn compilation_default_never() {
-        let args = CompileOnceArgs::parse_from(["tinymist", "main.typ"]);
-        let verse = args
-            .resolve_system()
-            .expect("failed to resolve system universe");
-
-        let snap = CompileSnapshot::from_world(verse.snapshot());
-
-        let graph = WorldComputeGraph::new(snap);
-
-        let needs_run = ProjectCompilation::run(&graph).expect("failed to compile diagnostics");
-
-        assert!(!needs_run);
-    }
-
-    // todo: on demand compilation
-    #[test]
-    fn compilation_run_paged_diagnostics() {
-        let args = CompileOnceArgs::parse_from(["tinymist", "main.typ"]);
-        let verse = args
-            .resolve_system()
-            .expect("failed to resolve system universe");
-
-        let mut snap = CompileSnapshot::from_world(verse.snapshot());
-
-        snap.signal = CompileSignal {
-            by_entry_update: true,
-            by_fs_events: false,
-            by_mem_events: false,
-        };
-
-        let graph = WorldComputeGraph::new(snap);
-
-        let needs_run = ProjectCompilation::run(&graph).expect("failed to compile diagnostics");
-
-        assert!(needs_run);
-    }
-
-    use chrono::{DateTime, Utc};
-    use tinymist_std::time::*;
-
-    /// Parses a UNIX timestamp according to <https://reproducible-builds.org/specs/source-date-epoch/>
-    pub fn convert_source_date_epoch(seconds: i64) -> Result<DateTime<Utc>, String> {
-        DateTime::from_timestamp(seconds, 0).ok_or_else(|| "timestamp out of range".to_string())
-    }
-
-    /// Parses a UNIX timestamp according to <https://reproducible-builds.org/specs/source-date-epoch/>
-    pub fn convert_system_time(seconds: i64) -> Result<Time, String> {
-        if seconds < 0 {
-            return Err("negative timestamp since unix epoch".to_string());
-        }
-
-        Time::UNIX_EPOCH
-            .checked_add(Duration::new(seconds as u64, 0))
-            .ok_or_else(|| "timestamp out of range".to_string())
-    }
-
-    #[test]
-    fn test_timestamp_chrono() {
-        let timestamp = 1_000_000_000;
-        let date_time = convert_source_date_epoch(timestamp).unwrap();
-        assert_eq!(date_time.timestamp(), timestamp);
-    }
-
-    #[test]
-    fn test_timestamp_system() {
-        let timestamp = 1_000_000_000;
-        let date_time = convert_system_time(timestamp).unwrap();
-        assert_eq!(
-            date_time
-                .duration_since(Time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            timestamp as u64
-        );
-    }
-
-    use typst::foundations::Datetime as TypstDatetime;
-
-    fn convert_datetime_chrono(date_time: DateTime<Utc>) -> Option<TypstDatetime> {
-        use chrono::{Datelike, Timelike};
-        TypstDatetime::from_ymd_hms(
-            date_time.year(),
-            date_time.month().try_into().ok()?,
-            date_time.day().try_into().ok()?,
-            date_time.hour().try_into().ok()?,
-            date_time.minute().try_into().ok()?,
-            date_time.second().try_into().ok()?,
-        )
-    }
-
-    #[test]
-    fn test_timestamp_pdf() {
-        let timestamp = 1_000_000_000;
-        let date_time = convert_source_date_epoch(timestamp).unwrap();
-        assert_eq!(date_time.timestamp(), timestamp);
-        let chrono_pdf_ts = convert_datetime_chrono(date_time).unwrap();
-
-        let timestamp = 1_000_000_000;
-        let date_time = convert_system_time(timestamp).unwrap();
-        let system_pdf_ts = tinymist_std::time::to_typst_time(date_time.into());
-        assert_eq!(chrono_pdf_ts, system_pdf_ts);
-    }
-
-    struct TestWorkspace {
-        root: PathBuf,
-    }
-
-    impl TestWorkspace {
-        fn new(files: &[(&str, &str)]) -> Self {
-            static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
-
-            let root = std::env::temp_dir().join(format!(
-                "tinymist-export-path-test-{}-{}",
-                std::process::id(),
-                NEXT_ID.fetch_add(1, Ordering::Relaxed),
-            ));
-            fs::create_dir_all(&root).expect("failed to create test workspace");
-
-            for (path, contents) in files {
-                let path = root.join(path);
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent).expect("failed to create parent directory");
-                }
-                fs::write(path, contents).expect("failed to write test source");
-            }
-
-            Self { root }
-        }
-
-        fn graph(&self, main: &str) -> LspComputeGraph {
-            let input = self.root.join(main);
-            let args = CompileOnceArgs::parse_from([
-                "tinymist".to_owned(),
-                input.to_string_lossy().into_owned(),
-                "--root".to_owned(),
-                self.root.to_string_lossy().into_owned(),
-            ]);
-            let verse = args.resolve().expect("failed to resolve lsp universe");
-            let snap = CompileSnapshot::from_world(verse.snapshot());
-
-            WorldComputeGraph::new(snap)
-        }
-    }
-
-    impl Drop for TestWorkspace {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
-        }
-    }
-
-    fn pdf_task(output: Option<&str>) -> ProjectTask {
-        ProjectTask::ExportPdf(ExportPdfTask {
-            export: ProjectExportTask {
-                when: TaskWhen::Never,
-                output: output.map(PathPattern::new),
-                transform: vec![],
-            },
-            ..Default::default()
-        })
-    }
-
-    #[test]
-    fn test_prepare_output_path_preserves_multi_dot_pdf_names() {
-        let workspace = TestWorkspace::new(&[
-            ("Chapter 1.1.typ", ""),
-            ("Chapter 1.1.1.typ", ""),
-            ("test....typ", ""),
-            ("README", ""),
-        ]);
-        let task = pdf_task(Some("$root/$dir/$name"));
-
-        for (main, expected) in [
-            ("Chapter 1.1.typ", "Chapter 1.1.pdf"),
-            ("Chapter 1.1.1.typ", "Chapter 1.1.1.pdf"),
-            ("test....typ", "test....pdf"),
-            ("README", "README.pdf"),
-        ] {
-            let graph = workspace.graph(main);
-            assert_eq!(
-                ExportTask::prepare_output_path(&task, &graph).unwrap(),
-                Some(workspace.root.join(expected))
-            );
-        }
-    }
-
-    #[test]
-    fn test_prepare_output_path_explicit_dir_name_matches_default() {
-        let workspace = TestWorkspace::new(&[
-            ("Chapter 1.1.typ", ""),
-            ("chapters/Chapter 1.1.typ", ""),
-            ("README", ""),
-            ("docs/README", ""),
-        ]);
-
-        for (main, expected) in [
-            ("Chapter 1.1.typ", "Chapter 1.1.pdf"),
-            ("chapters/Chapter 1.1.typ", "chapters/Chapter 1.1.pdf"),
-            ("README", "README.pdf"),
-            ("docs/README", "docs/README.pdf"),
-        ] {
-            let graph = workspace.graph(main);
-            let expected = Some(workspace.root.join(expected));
-
-            assert_eq!(
-                ExportTask::prepare_output_path(&pdf_task(None), &graph).unwrap(),
-                expected
-            );
-            assert_eq!(
-                ExportTask::prepare_output_path(&pdf_task(Some("$dir/$name")), &graph).unwrap(),
-                expected
-            );
-        }
-    }
-}
+#[cfg(all(test, feature = "system"))]
+#[path = "export_tests.rs"]
+mod tests;
