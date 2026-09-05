@@ -721,6 +721,7 @@ impl Decl {
         match self {
             Self::Module(ModuleDecl { fid, .. }) => Some(*fid),
             Self::BibEntry(NameRangeDecl { at, .. }) => Some(at.0),
+            Self::Docs(DocsDecl { base, .. }) => base.file_id(),
             that => that.span().id(),
         }
     }
@@ -748,20 +749,19 @@ impl Decl {
 
 impl Ord for Decl {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        let base = match (self, other) {
-            (Self::Generated(l), Self::Generated(r)) => l.0.0.cmp(&r.0.0),
-            (Self::Module(l), Self::Module(r)) => l.fid.into_raw().cmp(&r.fid.into_raw()),
-            (Self::Docs(l), Self::Docs(r)) => l.var.cmp(&r.var).then_with(|| l.base.cmp(&r.base)),
-            _ => self.span().into_raw().cmp(&other.span().into_raw()),
-        };
-
-        base.then_with(|| self.name().cmp(other.name()))
+        // Raw file-id and span identities are assigned in interning order,
+        // which depends on thread scheduling. Every ordered collection and
+        // sort over declarations (and types containing them) must therefore
+        // use the content-stable comparison, or inferred results change
+        // between runs.
+        self.strict_cmp(other)
     }
 }
 
-trait StrictCmp {
-    /// Low-performance comparison but it is free from the concurrency issue.
-    /// This is only used for making stable test snapshots.
+pub(crate) trait StrictCmp {
+    /// Compares by stable content instead of raw interned identity, which is
+    /// assigned in interning order and therefore depends on thread
+    /// scheduling.
     fn strict_cmp(&self, other: &Self) -> std::cmp::Ordering;
 }
 
@@ -784,6 +784,13 @@ impl Decl {
 
 impl StrictCmp for TypstFileId {
     fn strict_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Identical ids need no path comparison; this keeps the common
+        // same-file case cheap now that the default `Decl` ordering is
+        // content-stable.
+        if self == other {
+            return std::cmp::Ordering::Equal;
+        }
+
         fn root_cmp(left: &VirtualRoot, right: &VirtualRoot) -> std::cmp::Ordering {
             match (left, right) {
                 (VirtualRoot::Project, VirtualRoot::Project) => std::cmp::Ordering::Equal,
@@ -1463,7 +1470,9 @@ mod tests {
     use typst::syntax::{FileId, RootedPath, VirtualPath, VirtualRoot};
 
     use super::{Decl, StrictCmp};
+    use crate::adt::interner::Interned;
     use crate::prelude::TypstFileId;
+    use crate::ty::TypeVar;
 
     fn package(spec: &str) -> typst::syntax::package::PackageSpec {
         typst::syntax::package::PackageSpec::from_str(spec).expect("valid package spec")
@@ -1545,5 +1554,15 @@ mod tests {
             Ordering::Equal
         );
         assert_ne!(package_file.strict_cmp(&other_path), Ordering::Equal);
+    }
+
+    #[test]
+    fn docs_decl_inherits_base_file_id() {
+        let fid = file_id(VirtualRoot::Project, "/main.typ");
+        let base: Interned<Decl> = Decl::module(fid).into();
+        let var = TypeVar::new("input".into(), base.clone());
+        let docs = Decl::docs(base, var);
+
+        assert_eq!(docs.file_id(), Some(fid));
     }
 }
