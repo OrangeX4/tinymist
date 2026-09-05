@@ -147,15 +147,20 @@ impl<M: PathAccessModel> NotifyAccessModel<M> {
         }
     }
 
-    /// Notify the access model with a filesystem event
-    pub fn notify(&mut self, changeset: FileChangeSet) {
+    /// Notify the access model, returning whether the byte state or inventory changed.
+    pub fn notify(&mut self, changeset: FileChangeSet) -> bool {
+        let mut changed = false;
         for path in changeset.removes {
-            self.files.remove_mut(&path);
+            changed |= self.files.remove_mut(&path);
         }
 
         for (path, contents) in changeset.inserts {
-            self.files.insert_mut(path, contents);
+            if self.files.get(&path) != Some(&contents) {
+                self.files.insert_mut(path, contents);
+                changed = true;
+            }
         }
+        changed
     }
 }
 

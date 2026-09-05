@@ -20,10 +20,10 @@ use tinymist_lint::{KnownIssues, LintInfo};
 use tinymist_project::{LspComputeGraph, LspWorld, TaskWhen};
 use tinymist_std::hash::{FxDashMap, hash128};
 use tinymist_std::typst::TypstDocument;
+use tinymist_world::DETACHED_ENTRY;
 use tinymist_world::debug_loc::DataSource;
 use tinymist_world::package::registry::PackageIndexEntry;
 use tinymist_world::vfs::{PathResolution, WorkspaceResolver};
-use tinymist_world::{DETACHED_ENTRY, EntryReader};
 use typst::diag::{At, FileError, FileResult, SourceDiagnostic, SourceResult, StrResult};
 use typst::foundations::{Bytes, IntoValue, Module, NativeElement, StyleChain, Styles};
 use typst::introspection::Introspector;
@@ -48,12 +48,14 @@ use crate::analysis::{
 use crate::docs::{DefDocs, TidyModuleDocs};
 use crate::syntax::{
     Decl, DefKind, ExprInfo, LexicalScope, ModuleDependency, SyntaxClass, classify_syntax,
-    construct_module_dependencies, is_mark, resolve_id_by_path, scan_workspace_files,
+    construct_module_dependencies, is_mark, resolve_id_by_path,
 };
 use crate::upstream::{Tooltip, tooltip_};
 use crate::{
     ColorTheme, CompilerQueryRequest, LspPosition, LspRange, LspWorldExt, PositionEncoding,
 };
+
+mod workspace_files;
 
 macro_rules! interned_str {
     ($name:ident, $value:expr) => {
@@ -357,35 +359,6 @@ impl LocalContext {
     #[cfg(test)]
     pub fn test_files(&mut self, f: impl FnOnce() -> Vec<TypstFileId>) {
         self.caches.root_files.get_or_init(f);
-    }
-
-    /// Get all the source files in the workspace.
-    pub(crate) fn completion_files(&self, pref: &PathKind) -> impl Iterator<Item = &TypstFileId> {
-        let regexes = pref.ext_matcher();
-        self.caches
-            .completion_files
-            .get_or_init(|| {
-                if let Some(root) = self.world().entry_state().workspace_root() {
-                    scan_workspace_files(&root, PathKind::Special.ext_matcher(), |path| {
-                        VirtualPath::virtualize(&root, &root.join(path))
-                            .ok()
-                            .map(|path| WorkspaceResolver::workspace_file(Some(&root), path))
-                    })
-                    .into_iter()
-                    .flatten()
-                    .collect()
-                } else {
-                    vec![]
-                }
-            })
-            .iter()
-            .filter(move |fid| {
-                fid.vpath()
-                    .as_rooted_path_compat()
-                    .extension()
-                    .and_then(|path| path.to_str())
-                    .is_some_and(|path| regexes.is_match(path))
-            })
     }
 
     /// Get all the source files in the workspace.

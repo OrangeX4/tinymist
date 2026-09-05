@@ -44,9 +44,11 @@ where
         &mut self.inner
     }
 
-    /// Clear the shadowed files
-    pub fn clear_shadow(&mut self) {
+    /// Clear the shadowed files, returning whether the inventory changed.
+    pub fn clear_shadow(&mut self) -> bool {
+        let changed = !self.files.is_empty();
         self.files = RedBlackTreeMapSync::default();
+        changed
     }
 }
 
@@ -56,31 +58,29 @@ impl<M> OverlayAccessModel<ImmutPath, M> {
         self.files.keys().cloned().collect()
     }
 
-    /// Add a shadow file to the [`OverlayAccessModel`]
+    /// Add a shadow file, returning whether the byte state or inventory changed.
     pub fn add_file<Q: Ord + ?Sized>(
         &mut self,
         path: &Q,
         snap: FileSnapshot,
         cast: impl Fn(&Q) -> ImmutPath,
-    ) where
-        ImmutPath: Borrow<Q>,
-    {
-        match self.files.get_mut(path) {
-            Some(e) => {
-                *e = snap;
-            }
-            None => {
-                self.files.insert_mut(cast(path), snap);
-            }
-        }
-    }
-
-    /// Remove a shadow file from the [`OverlayAccessModel`]
-    pub fn remove_file<Q: Ord + ?Sized>(&mut self, path: &Q)
+    ) -> bool
     where
         ImmutPath: Borrow<Q>,
     {
-        self.files.remove_mut(path);
+        if self.files.get(path) == Some(&snap) {
+            return false;
+        }
+        self.files.insert_mut(cast(path), snap);
+        true
+    }
+
+    /// Remove a shadow file, returning whether the inventory changed.
+    pub fn remove_file<Q: Ord + ?Sized>(&mut self, path: &Q) -> bool
+    where
+        ImmutPath: Borrow<Q>,
+    {
+        self.files.remove_mut(path)
     }
 }
 
@@ -90,21 +90,23 @@ impl<M> OverlayAccessModel<FileId, M, RawFileId> {
         self.files.keys().copied().map(FileId::from_raw).collect()
     }
 
-    /// Add a shadow file to the [`OverlayAccessModel`]
-    pub fn add_file(&mut self, id: &FileId, snap: FileSnapshot, cast: impl Fn(&FileId) -> FileId) {
-        match self.files.get_mut(&id.into_raw()) {
-            Some(e) => {
-                *e = snap;
-            }
-            None => {
-                self.files.insert_mut(cast(id).into_raw(), snap);
-            }
+    /// Add a shadow file, returning whether the byte state or inventory changed.
+    pub fn add_file(
+        &mut self,
+        id: &FileId,
+        snap: FileSnapshot,
+        cast: impl Fn(&FileId) -> FileId,
+    ) -> bool {
+        if self.files.get(&id.into_raw()) == Some(&snap) {
+            return false;
         }
+        self.files.insert_mut(cast(id).into_raw(), snap);
+        true
     }
 
-    /// Remove a shadow file from the [`OverlayAccessModel`]
-    pub fn remove_file(&mut self, id: &FileId) {
-        self.files.remove_mut(&id.into_raw());
+    /// Remove a shadow file, returning whether the inventory changed.
+    pub fn remove_file(&mut self, id: &FileId) -> bool {
+        self.files.remove_mut(&id.into_raw())
     }
 }
 

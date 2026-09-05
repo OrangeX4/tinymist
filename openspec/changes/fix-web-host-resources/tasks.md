@@ -1,0 +1,6 @@
+- [x] Reproduce Unicode import failure with the real browser LSP.
+- [x] Replace lossy Web file URI conversion and add a reserved-character round-trip regression.
+- [x] Expose font and filesystem publication through project interrupts.
+- [x] Include editor-owned memory files in the analysis workspace inventory.
+- [x] Reproduce and fix unread-file and batch-order VFS revision failures.
+- [x] Verify WASM language queries, resource loading, and native conversion regression.

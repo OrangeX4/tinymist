@@ -137,6 +137,41 @@ impl TinymistLanguageServer {
 }
 
 impl TinymistLanguageServer {
+    /// Replaces the initialized server's fonts without discarding open documents.
+    /// Hosts may use lazy font slots and call this again when bytes arrive.
+    pub fn set_fonts(
+        &mut self,
+        fonts: std::sync::Arc<crate::world::font::FontResolverImpl>,
+    ) -> Result<(), JsValue> {
+        let state = self
+            .state
+            .state_mut()
+            .ok_or_else(|| JsValue::from_str("language server is not initialized"))?;
+        state.config.fonts.take();
+        let _ = state.config.fonts.set(crate::utils::Derived(fonts.clone()));
+        state
+            .project
+            .interrupt(tinymist_project::Interrupt::Font(fonts));
+        state.schedule_async();
+        Ok(())
+    }
+
+    /// Applies verified host filesystem bytes to the initialized server.
+    pub fn update_filesystem(
+        &mut self,
+        changes: tinymist_project::vfs::FileChangeSet,
+    ) -> Result<(), JsValue> {
+        let state = self
+            .state
+            .state_mut()
+            .ok_or_else(|| JsValue::from_str("language server is not initialized"))?;
+        state.project.interrupt(tinymist_project::Interrupt::Fs(
+            tinymist_project::vfs::FilesystemEvent::Update(changes, false),
+        ));
+        state.schedule_async();
+        Ok(())
+    }
+
     fn next_request_id(&mut self) -> RequestId {
         let req_id = self.next_request_id;
         self.next_request_id = self.next_request_id.checked_add(1).unwrap_or(1);

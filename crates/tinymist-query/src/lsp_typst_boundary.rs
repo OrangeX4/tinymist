@@ -86,14 +86,44 @@ fn url_from_file_path(path: &Path) -> anyhow::Result<Url> {
 
 #[cfg(target_arch = "wasm32")]
 fn url_from_file_path(path: &Path) -> anyhow::Result<Url> {
-    // In WASM, create a simple file:// URL
-    let path_str = path.to_string_lossy();
-    let url_str = if path_str.starts_with('/') {
-        format!("file://{}", path_str)
-    } else {
-        format!("file:///{}", path_str)
-    };
-    Url::parse(&url_str).map_err(|e| anyhow::anyhow!("could not convert path to URI: {}", e))
+    virtual_path_to_url(path)
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn virtual_path_to_url(path: &Path) -> anyhow::Result<Url> {
+    // wasm32-unknown-unknown has rooted virtual paths but no native absolute paths.
+    if !path.has_root() {
+        anyhow::bail!("virtual path must be absolute");
+    }
+    let mut url = Url::parse("file:///")?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("invalid file URL"))?;
+        segments.clear();
+        for component in path.components() {
+            match component {
+                std::path::Component::RootDir => {}
+                std::path::Component::Normal(part) => {
+                    segments.push(
+                        part.to_str()
+                            .ok_or_else(|| anyhow::anyhow!("virtual path is not UTF-8"))?,
+                    );
+                }
+                _ => anyhow::bail!("virtual path must be normalized"),
+            }
+        }
+    }
+    Ok(url)
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn virtual_url_to_path(uri: &Url) -> PathBuf {
+    PathBuf::from(
+        percent_encoding::percent_decode_str(uri.path())
+            .decode_utf8_lossy()
+            .as_ref(),
+    )
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -104,12 +134,22 @@ fn url_to_file_path(uri: &Url) -> PathBuf {
 
 #[cfg(target_arch = "wasm32")]
 fn url_to_file_path(uri: &Url) -> PathBuf {
-    // In WASM, manually parse the URL path
-    PathBuf::from(uri.path())
+    virtual_url_to_path(uri)
 }
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn web_paths_preserve_unicode_and_reserved_characters() {
+        for name in ["中文.typ", "space # ? %25.typ", "literal%20.typ"] {
+            let path = Path::new("/workspace").join(name);
+            let uri = virtual_path_to_url(&path).unwrap();
+            assert_eq!(uri.query(), None);
+            assert_eq!(uri.fragment(), None);
+            assert_eq!(virtual_url_to_path(&uri), path);
+        }
+    }
 
     #[test]
     fn test_untitled() {

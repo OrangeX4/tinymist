@@ -485,7 +485,7 @@ impl<M: PathAccessModel + Sized> RevisingVfs<'_, M> {
             }
 
             // Always changes view if snap is none.
-            self.view_changed = snap.is_none();
+            self.view_changed |= snap.is_none();
             for fid in fids.clone() {
                 self.invalidate_file_id(fid, snap);
             }
@@ -513,7 +513,7 @@ impl<M: PathAccessModel + Sized> RevisingVfs<'_, M> {
             e.source = Arc::default();
             changed = true;
         });
-        self.view_changed = changed;
+        self.view_changed |= changed;
     }
 
     /// Reset the shadowing files in [`OverlayAccessModel`].
@@ -525,8 +525,9 @@ impl<M: PathAccessModel + Sized> RevisingVfs<'_, M> {
             self.invalidate_file_id(fid, None);
         }
 
-        self.am().clear_shadow();
-        self.am().inner.inner.clear_shadow();
+        let ids_changed = self.am().clear_shadow();
+        let paths_changed = self.am().inner.inner.clear_shadow();
+        self.view_changed |= ids_changed || paths_changed;
     }
 
     /// Unconditionally changes the view of the vfs.
@@ -538,7 +539,8 @@ impl<M: PathAccessModel + Sized> RevisingVfs<'_, M> {
     /// Adds a shadowing file to the [`OverlayAccessModel`].
     pub fn map_shadow(&mut self, path: &Path, snap: FileSnapshot) -> FileResult<()> {
         self.invalidate_path(path, Some(&snap));
-        self.am().inner.inner.add_file(path, snap, |c| c.into());
+        let changed = self.am().inner.inner.add_file(path, snap, |c| c.into());
+        self.view_changed |= changed;
 
         Ok(())
     }
@@ -546,7 +548,8 @@ impl<M: PathAccessModel + Sized> RevisingVfs<'_, M> {
     /// Removes a shadowing file from the [`OverlayAccessModel`].
     pub fn unmap_shadow(&mut self, path: &Path) -> FileResult<()> {
         self.invalidate_path(path, None);
-        self.am().inner.inner.remove_file(path);
+        let changed = self.am().inner.inner.remove_file(path);
+        self.view_changed |= changed;
 
         Ok(())
     }
@@ -554,7 +557,8 @@ impl<M: PathAccessModel + Sized> RevisingVfs<'_, M> {
     /// Adds a shadowing file to the [`OverlayAccessModel`] by file id.
     pub fn map_shadow_by_id(&mut self, file_id: FileId, snap: FileSnapshot) -> FileResult<()> {
         self.invalidate_file_id(file_id, Some(&snap));
-        self.am().add_file(&file_id, snap, |c| *c);
+        let changed = self.am().add_file(&file_id, snap, |c| *c);
+        self.view_changed |= changed;
 
         Ok(())
     }
@@ -562,7 +566,8 @@ impl<M: PathAccessModel + Sized> RevisingVfs<'_, M> {
     /// Removes a shadowing file from the [`OverlayAccessModel`] by file id.
     pub fn remove_shadow_by_id(&mut self, file_id: FileId) {
         self.invalidate_file_id(file_id, None);
-        self.am().remove_file(&file_id);
+        let changed = self.am().remove_file(&file_id);
+        self.view_changed |= changed;
     }
 
     /// Notifies the access model with a filesystem event.
@@ -582,7 +587,8 @@ impl<M: PathAccessModel + Sized> RevisingVfs<'_, M> {
             self.invalidate_path(path, Some(snap));
         }
 
-        self.am().inner.inner.inner.notify(event);
+        let changed = self.am().inner.inner.inner.notify(event);
+        self.view_changed |= changed;
     }
 }
 
@@ -707,6 +713,9 @@ fn from_utf8_or_bom(buf: &[u8]) -> FileResult<&str> {
         buf
     })?)
 }
+
+#[cfg(test)]
+mod revision_tests;
 
 #[cfg(test)]
 mod tests {
